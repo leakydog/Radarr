@@ -1,0 +1,82 @@
+# Fork maintenance: keep `develop` a pristine mirror of Radarr/Radarr and
+# replay our local patches on top of it.
+#
+# Layout:
+#   develop                  -> fast-forwarded to upstream/develop, never edited
+#   perf-movie-stats-mapping -> develop + our patch commits (this file included)
+#
+# Add a new local fix by committing it on the patch branch. Scheduled runs only
+# fire from the repository's default branch, so point the default branch at the
+# patch branch (or trigger manually via workflow_dispatch).
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM: https://github.com/Radarr/Radarr.git
+  MIRROR_BRANCH: develop
+  PATCH_BRANCH: perf-movie-stats-mapping
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PATCH_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Configure git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "$UPSTREAM"
+          git fetch upstream "$MIRROR_BRANCH"
+
+      - name: Fast-forward mirror branch
+        run: |
+          git push origin "upstream/$MIRROR_BRANCH:refs/heads/$MIRROR_BRANCH"
+
+      - name: Rebase patches onto upstream
+        id: rebase
+        run: |
+          before=$(git rev-parse HEAD)
+          if git rebase "upstream/$MIRROR_BRANCH"; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            if [ "$before" != "$(git rev-parse HEAD)" ]; then
+              git push --force-with-lease origin "HEAD:refs/heads/$PATCH_BRANCH"
+            fi
+          else
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt
+            git rebase --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open issue on conflict
+        if: steps.rebase.outputs.conflict == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const files = fs.readFileSync('/tmp/conflicts.txt', 'utf8').trim();
+            const title = `Upstream sync conflict on ${process.env.PATCH_BRANCH}`;
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo, state: 'open', labels: 'upstream-sync'
+            });
+            if (open.some(i => i.title === title)) return;
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo, title, labels: ['upstream-sync'],
+              body: `Rebasing \`${process.env.PATCH_BRANCH}\` onto \`upstream/${process.env.MIRROR_BRANCH}\` hit conflicts in:\n\n\`\`\`\n${files}\n\`\`\`\n\nResolve locally, then \`git push --force-with-lease\`.`
+            });
+
+      - name: Fail on conflict
+        if: steps.rebase.outputs.conflict == 'true'
+        run: exit 1
